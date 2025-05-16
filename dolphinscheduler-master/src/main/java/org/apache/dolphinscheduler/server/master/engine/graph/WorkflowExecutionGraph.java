@@ -20,6 +20,7 @@ package org.apache.dolphinscheduler.server.master.engine.graph;
 import org.apache.dolphinscheduler.common.enums.Flag;
 import org.apache.dolphinscheduler.dao.entity.TaskInstance;
 import org.apache.dolphinscheduler.plugin.task.api.enums.TaskExecutionStatus;
+import org.apache.dolphinscheduler.plugin.task.api.task.LoopLogicTaskChannelFactory;
 import org.apache.dolphinscheduler.plugin.task.api.utils.TaskTypeUtils;
 import org.apache.dolphinscheduler.server.master.engine.task.runnable.ITaskExecutionRunnable;
 
@@ -53,6 +54,8 @@ public class WorkflowExecutionGraph implements IWorkflowExecutionGraph {
 
     private final Set<String> inActiveTaskExecutionRunnable;
 
+    private final Map<String, Set<String>> loopBodies;
+
     public WorkflowExecutionGraph() {
         this.failureTaskChains = new HashSet<>();
         this.pausedTaskChains = new HashSet<>();
@@ -63,6 +66,7 @@ public class WorkflowExecutionGraph implements IWorkflowExecutionGraph {
         this.totalTaskExecuteRunnableMap = new HashMap<>();
         this.activeTaskExecutionRunnable = new HashSet<>();
         this.inActiveTaskExecutionRunnable = new HashSet<>();
+        this.loopBodies = new HashMap<>();
     }
 
     @Override
@@ -70,12 +74,24 @@ public class WorkflowExecutionGraph implements IWorkflowExecutionGraph {
         totalTaskExecuteRunnableMap.put(taskExecutionRunnable.getName(), taskExecutionRunnable);
         predecessors.computeIfAbsent(taskExecutionRunnable.getName(), k -> new HashSet<>());
         successors.computeIfAbsent(taskExecutionRunnable.getName(), k -> new HashSet<>());
+
+        if (taskExecutionRunnable.getTaskDefinition().getTaskType().equals(LoopLogicTaskChannelFactory.NAME)) {
+            loopBodies.computeIfAbsent(taskExecutionRunnable.getName(), k -> new HashSet<>());
+        }
     }
 
     @Override
     public void addEdge(String fromTaskName, Set<String> toTaskNames) {
         successors.computeIfAbsent(fromTaskName, k -> new HashSet<>()).addAll(toTaskNames);
         toTaskNames.forEach(toTask -> predecessors.computeIfAbsent(toTask, k -> new HashSet<>()).add(fromTaskName));
+
+        // if the task is a loop body, add the edge to the loop body
+        ITaskExecutionRunnable taskExecutionRunnable = getTaskExecutionRunnableByName(fromTaskName);
+        if (taskExecutionRunnable.getTaskDefinition().getTaskType().equals(LoopLogicTaskChannelFactory.NAME)) {
+            // get loop node paramter
+            List param = taskExecutionRunnable.getTaskDefinition().getTaskParamList();
+            loopBodies.computeIfAbsent(fromTaskName, k -> new HashSet<>()).addAll(toTaskNames);
+        }
     }
 
     @Override
@@ -104,11 +120,69 @@ public class WorkflowExecutionGraph implements IWorkflowExecutionGraph {
         if (!successors.containsKey(taskName)) {
             throw new IllegalArgumentException("Cannot find the task code in graph");
         }
-        return successors
+        List<ITaskExecutionRunnable> suc = successors
                 .get(taskName)
                 .stream()
                 .map(this::getTaskExecutionRunnableByName)
                 .collect(Collectors.toList());
+        if (CollectionUtils.isEmpty(suc)) {
+            // if the task has no successors, it could be a loop body node
+            // we need to recursively search from this node all the way back to the start node
+            // and return the first loop node as the successor
+            String loopNode = getNearestLoopNode(taskName);
+            if (loopNode != null) {
+                ITaskExecutionRunnable loopTask = getTaskExecutionRunnableByName(loopNode);
+                if (loopTask != null) {
+                    return List.of(loopTask);
+                }
+            }
+        }
+        return suc;
+    }
+
+    private String getNearestLoopNode(final String taskName) {
+        ITaskExecutionRunnable taskExecutionRunnable = getTaskExecutionRunnableByName(taskName);
+        final String taskType = taskExecutionRunnable.getTaskDefinition().getTaskType();
+        if (taskType.equals("CONDITIONS")) {
+            activeTaskExecutionRunnable.remove(taskName);
+            removeAllSuccessorsFromInActiveList(taskName);
+            return taskName;
+        }
+        for (String predecessor : predecessors.get(taskName)) {
+            String loopNode = getNearestLoopNode(predecessor);
+            if (loopNode != null) {
+                return loopNode;
+            }
+        }
+        return null;
+    }
+
+    // private boolean isLoopDone(final String taskName, final String loopNodeName) {
+    //     ITaskExecutionRunnable taskExecutionRunnable = getTaskExecutionRunnableByName(taskName);
+    //     ITaskExecutionRunnable loopNode = getTaskExecutionRunnableByName(loopNodeName);
+    //     final String taskType = taskExecutionRunnable.getTaskDefinition().getTaskType();
+    //     if (taskType.equals("CONDITIONS")) {
+    //         return true;
+    //     }
+    //     for (String predecessor : predecessors.get(taskName)) {
+    //         if (isLoopDone(predecessor)) {
+    //             return true;
+    //         }
+    //     }
+    //     return false;
+    // }
+
+    // remove all successors from inactive list
+    private void removeAllSuccessorsFromInActiveList(final String taskName) {
+        inActiveTaskExecutionRunnable.remove(taskName);
+        List<ITaskExecutionRunnable> sucs = successors
+                .get(taskName)
+                .stream()
+                .map(this::getTaskExecutionRunnableByName)
+                .collect(Collectors.toList());
+        for (ITaskExecutionRunnable successor : sucs) {
+            removeAllSuccessorsFromInActiveList(successor.getName());
+        }
     }
 
     @Override
@@ -185,12 +259,29 @@ public class WorkflowExecutionGraph implements IWorkflowExecutionGraph {
                 || isTaskExecutionRunnableInActive(taskExecutionRunnable)) {
             return false;
         }
-        return getPredecessors(taskExecutionRunnable.getName())
-                .stream()
-                .allMatch(predecessor -> isTaskExecutionRunnableInActive(predecessor)
-                        && !isTaskExecutionRunnableFailed(predecessor)
-                        && !isTaskExecutionRunnablePaused(predecessor)
-                        && !isTaskExecutionRunnableKilled(predecessor));
+        List<ITaskExecutionRunnable> predecessors = getPredecessors(taskExecutionRunnable.getName());
+        boolean allMatch = true;
+        for(ITaskExecutionRunnable predecessor : predecessors) {
+            boolean isPredecessorInActive = isTaskExecutionRunnableInActive(predecessor);
+            boolean isPredecessorFailed = isTaskExecutionRunnableFailed(predecessor);
+            boolean isPredecessorPaused = isTaskExecutionRunnablePaused(predecessor);
+            boolean isPredecessorKilled = isTaskExecutionRunnableKilled(predecessor);
+
+            if (!isPredecessorInActive
+                    || isPredecessorFailed
+                    || isPredecessorPaused
+                    || isPredecessorKilled) {
+                allMatch = false;
+                break;
+            }
+        }
+        return allMatch;
+        // return getPredecessors(taskExecutionRunnable.getName())
+        //         .stream()
+        //         .allMatch(predecessor -> isTaskExecutionRunnableInActive(predecessor)
+        //                 && !isTaskExecutionRunnableFailed(predecessor)
+        //                 && !isTaskExecutionRunnablePaused(predecessor)
+        //                 && !isTaskExecutionRunnableKilled(predecessor));
     }
 
     @Override
@@ -264,7 +355,19 @@ public class WorkflowExecutionGraph implements IWorkflowExecutionGraph {
 
     @Override
     public boolean isEndOfTaskChain(final ITaskExecutionRunnable taskExecutionRunnable) {
-        return successors.get(taskExecutionRunnable.getName()).isEmpty()
+        String taskName = taskExecutionRunnable.getName();
+        // Check if there are no successors
+        boolean noSuccessors = successors.get(taskName).isEmpty();
+        
+        // If no direct successors, check for loop condition
+        if (noSuccessors) {
+            String loopNode = getNearestLoopNode(taskName);
+            if (loopNode != null) {
+                return false; // Not end of chain if it's part of a loop
+            }
+        }
+        
+        return noSuccessors
                 || isTaskExecutionRunnableKilled(taskExecutionRunnable)
                 || isTaskExecutionRunnablePaused(taskExecutionRunnable)
                 || isTaskExecutionRunnableFailed(taskExecutionRunnable);
